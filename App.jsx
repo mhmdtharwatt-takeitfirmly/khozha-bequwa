@@ -1,4 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
+import { auth, db } from "./firebase.js";
+import { createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut } from "firebase/auth";
+import { doc, getDoc, setDoc, collection, getDocs, query } from "firebase/firestore";
+
+const ADMIN_EMAILS = ["mhmd.thar@gmail.com"];
 
 const GALLUP_34 = [
   { name: "Achiever - المنجز", domain: "التنفيذ" },
@@ -78,11 +83,19 @@ const PC = { 1: "#1B3A5C", 2: "#D4A853", 3: "#D85A30" };
 const BRAND = { navy: "#1B3A5C", gold: "#D4A853", cream: "#F7F3ED" };
 
 const st = {
-  async load(key) { try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch { return null; } },
-  async save(key, data) { try { localStorage.setItem(key, JSON.stringify(data)); } catch {} }
+  async load(key, uid) {
+    if (!uid) return null;
+    try { const snap = await getDoc(doc(db, "users", uid, "data", key)); return snap.exists() ? snap.data().value : null; } catch { return null; }
+  },
+  async save(key, data, uid) {
+    if (!uid) return;
+    try { await setDoc(doc(db, "users", uid, "data", key), { value: data, updatedAt: new Date().toISOString() }); } catch(e) { console.error(e); }
+  }
 };
 
 export default function App() {
+  const [authState, setAuthState] = useState("loading");
+  const [user, setUser] = useState(null);
   const [view, setView] = useState("splash");
   const [profile, setProfile] = useState(null);
   const [entries, setEntries] = useState([]);
@@ -93,39 +106,32 @@ export default function App() {
   const [editIdx, setEditIdx] = useState(null);
 
   useEffect(() => {
-    async function init() {
-      const [p, e, t, d, w] = await Promise.all([st.load("kbq-profile"), st.load("kbq-entries"), st.load("kbq-tasks"), st.load("kbq-daily"), st.load("kbq-weekly")]);
-      let migrated = e || [];
-      if (migrated.length === 0) {
-        try {
-          const oldData = await st.load("strengths-data");
-          if (oldData && oldData.length > 0) {
-            const converted = oldData.map(old => {
-              const matchIdx = GALLUP_34.findIndex(g =>
-                g.name.toLowerCase().includes((old.name || "").toLowerCase().split(" - ")[0].split("-")[0].trim()) ||
-                g.name.includes(old.name)
-              );
-              return { ...old, strength_idx: matchIdx >= 0 ? matchIdx : null, name: matchIdx >= 0 ? GALLUP_34[matchIdx].name : old.name, domain: matchIdx >= 0 ? GALLUP_34[matchIdx].domain : "غير محدد", rank: old.rank || null, interact: old.interact || "", createdAt: old.createdAt || new Date().toISOString(), updatedAt: old.updatedAt || new Date().toISOString() };
-            }).filter(x => x.strength_idx !== null);
-            if (converted.length > 0) { migrated = converted; await st.save("kbq-entries", migrated); }
-          }
-        } catch {}
-      }
-      setProfile(p); setEntries(migrated); setTasks(t || []); setDailyLog(d || {}); setWeeklyReviews(w || []);
-      setLoading(false);
-      if (p) setView("home");
-    }
-    init();
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthState(u ? "authed" : "login");
+    });
+    return unsub;
   }, []);
 
+  useEffect(() => {
+    if (!user) return;
+    async function init() {
+      const uid = user.uid;
+      const [p, e, t, d, w] = await Promise.all([
+        st.load("profile", uid), st.load("entries", uid), st.load("tasks", uid), st.load("daily", uid), st.load("weekly", uid)
+      ]);
+      setProfile(p); setEntries(e || []); setTasks(t || []); setDailyLog(d || {}); setWeeklyReviews(w || []);
+      setLoading(false);
+      setView(p ? "home" : "splash");
+    }
+    init();
+  }, [user]);
+
+  const uid = user?.uid;
+
   const saveProfile = async (p) => {
-    setProfile(p); await st.save("kbq-profile", p);
-    try {
-      const allUsers = JSON.parse(localStorage.getItem("kbq-all-users") || "{}");
-      const uid = p.phone || p.name;
-      allUsers[uid] = { profile: p, entries, tasks, dailyLog };
-      localStorage.setItem("kbq-all-users", JSON.stringify(allUsers));
-    } catch {}
+    setProfile(p); await st.save("profile", p, uid);
+    await setDoc(doc(db, "users", uid, "meta", "profile"), { ...p, email: user.email, uid, updatedAt: new Date().toISOString() });
     setView("home");
   };
 
@@ -136,34 +142,86 @@ export default function App() {
     let next;
     if (editIdx !== null) { next = [...entries]; next[editIdx] = entry; setEditIdx(null); }
     else next = [...entries, entry];
-    setEntries(next); await st.save("kbq-entries", next); setView("home");
-  }, [entries, editIdx]);
+    setEntries(next); await st.save("entries", next, uid); setView("home");
+  }, [entries, editIdx, uid]);
 
   const deleteEntry = useCallback(async (idx) => {
     const next = entries.filter((_, i) => i !== idx);
-    setEntries(next); await st.save("kbq-entries", next);
-  }, [entries]);
+    setEntries(next); await st.save("entries", next, uid);
+  }, [entries, uid]);
 
-  const saveTasks = async (t) => { setTasks(t); await st.save("kbq-tasks", t); };
-  const saveDaily = async (d) => { setDailyLog(d); await st.save("kbq-daily", d); };
-  const saveWeekly = async (w) => { setWeeklyReviews(w); await st.save("kbq-weekly", w); };
+  const saveTasks = async (t) => { setTasks(t); await st.save("tasks", t, uid); };
+  const saveDaily = async (d) => { setDailyLog(d); await st.save("daily", d, uid); };
+  const saveWeekly = async (w) => { setWeeklyReviews(w); await st.save("weekly", w, uid); };
 
   const usedIdxs = entries.map(e => e.strength_idx);
 
-  if (loading) return <Wrap><p style={{ textAlign: "center", color: "var(--color-text-secondary)", padding: 40 }}>جارى التحميل...</p></Wrap>;
+  if (authState === "loading") return <Wrap><p style={{ textAlign: "center", color: "var(--color-text-secondary)", padding: 40 }}>جارى التحميل...</p></Wrap>;
+  if (authState === "login") return <AuthView onAuth={() => setAuthState("authed")} />;
+  if (loading) return <Wrap><p style={{ textAlign: "center", color: "var(--color-text-secondary)", padding: 40 }}>جارى تحميل البيانات...</p></Wrap>;
+
   if (view === "splash") return <SplashView onStart={() => setView("onboard")} />;
   if (view === "onboard") return <OnboardView existing={profile} onSave={saveProfile} />;
   if (view === "form") return <FormView initial={editIdx !== null ? entries[editIdx] : {}} usedIdxs={editIdx !== null ? usedIdxs.filter(i => i !== entries[editIdx].strength_idx) : usedIdxs} onSave={saveEntry} onCancel={() => { setEditIdx(null); setView("home"); }} />;
-  if (view === "detail" && editIdx !== null) return <DetailView entry={entries[editIdx]} onBack={() => { setEditIdx(null); setView("home"); }} onEdit={() => setView("form")} />;
+  if (view === "detail" && editIdx !== null) return <DetailView entry={entries[editIdx]} tasks={tasks} onBack={() => { setEditIdx(null); setView("home"); }} onEdit={() => setView("form")} />;
   if (view === "tasks") return <TaskBreakdownView entries={entries} tasks={tasks} onSave={(t) => { saveTasks(t); setView("tracker"); }} onBack={() => setView("home")} />;
   if (view === "tracker") return <DailyTrackerView tasks={tasks} dailyLog={dailyLog} onSave={saveDaily} onReview={() => setView("review")} onBack={() => setView("home")} />;
   if (view === "review") return <WeeklyReviewView entries={entries} tasks={tasks} dailyLog={dailyLog} reviews={weeklyReviews} onSave={(r) => { saveWeekly([...weeklyReviews, r]); setView("tracker"); }} onBack={() => setView("tracker")} />;
   if (view === "admin") return <AdminDashboard onBack={() => setView("home")} />;
 
-  return <HomeView profile={profile} entries={entries} tasks={tasks} dailyLog={dailyLog}
+  return <HomeView profile={profile} entries={entries} tasks={tasks} dailyLog={dailyLog} userEmail={user?.email}
     onNew={() => { setEditIdx(null); setView("form"); }} onSelect={(i) => { setEditIdx(i); setView("detail"); }}
     onDelete={deleteEntry} onExport={() => exportData(profile, entries)} onEditProfile={() => setView("onboard")}
-    onTasks={() => setView("tasks")} onTracker={() => setView("tracker")} onAdmin={() => setView("admin")} />;
+    onTasks={() => setView("tasks")} onTracker={() => setView("tracker")} onAdmin={() => setView("admin")}
+    onLogout={() => { signOut(auth); setAuthState("login"); setProfile(null); setEntries([]); setView("splash"); }} />;
+}
+
+function AuthView({ onAuth }) {
+  const [mode, setMode] = useState("login");
+  const [email, setEmail] = useState("");
+  const [pass, setPass] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const handle = async () => {
+    setError(""); setLoading(true);
+    try {
+      if (mode === "signup") await createUserWithEmailAndPassword(auth, email, pass);
+      else await signInWithEmailAndPassword(auth, email, pass);
+      onAuth();
+    } catch (e) {
+      if (e.code === "auth/email-already-in-use") setError("الإيميل ده مسجل قبل كده. سجّل دخول.");
+      else if (e.code === "auth/wrong-password" || e.code === "auth/invalid-credential") setError("الإيميل أو كلمة السر غلط.");
+      else if (e.code === "auth/weak-password") setError("كلمة السر لازم تكون 6 حروف على الأقل.");
+      else if (e.code === "auth/invalid-email") setError("الإيميل مش صحيح.");
+      else setError("حصل خطأ. حاول تانى.");
+    }
+    setLoading(false);
+  };
+
+  return (
+    <Wrap>
+      <div style={{ textAlign: "center", padding: "30px 0 16px" }}>
+        <Logo size="lg" />
+        <div style={{ fontSize: 13, color: "var(--color-text-secondary)", marginTop: 10 }}>تحديد الأهداف بناءً على نقاط القوة</div>
+      </div>
+      <FBox>
+        <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+          <button onClick={() => { setMode("login"); setError(""); }} style={{ flex: 1, padding: "8px 0", borderRadius: 8, border: "none", background: mode === "login" ? BRAND.navy : "var(--color-background-primary)", color: mode === "login" ? BRAND.gold : "var(--color-text-secondary)", fontSize: 13, fontWeight: 600, fontFamily: "inherit", cursor: "pointer" }}>تسجيل دخول</button>
+          <button onClick={() => { setMode("signup"); setError(""); }} style={{ flex: 1, padding: "8px 0", borderRadius: 8, border: "none", background: mode === "signup" ? BRAND.navy : "var(--color-background-primary)", color: mode === "signup" ? BRAND.gold : "var(--color-text-secondary)", fontSize: 13, fontWeight: 600, fontFamily: "inherit", cursor: "pointer" }}>حساب جديد</button>
+        </div>
+        <FLabel>البريد الإلكترونى</FLabel>
+        <FInput value={email} onChange={e => setEmail(e.target.value)} placeholder="example@email.com" type="email" style={{ direction: "ltr", textAlign: "left" }} />
+        <FLabel style={{ marginTop: 12 }}>كلمة السر</FLabel>
+        <FInput value={pass} onChange={e => setPass(e.target.value)} placeholder="6 حروف على الأقل" type="password" style={{ direction: "ltr", textAlign: "left" }}
+          onKeyDown={e => e.key === "Enter" && handle()} />
+        {error && <div style={{ marginTop: 8, padding: "8px 10px", borderRadius: 6, background: "#FCEBEB", color: "#A32D2D", fontSize: 12 }}>{error}</div>}
+      </FBox>
+      <BtnPrimary disabled={!email.trim() || pass.length < 6 || loading} onClick={handle}>
+        {loading ? "جارى..." : mode === "login" ? "دخول" : "إنشاء حساب"}
+      </BtnPrimary>
+    </Wrap>
+  );
 }
 
 function SplashView({ onStart }) {
@@ -192,6 +250,7 @@ function OnboardView({ existing, onSave }) {
   const [step, setStep] = useState(1);
   const [name, setName] = useState(existing?.name || "");
   const [phone, setPhone] = useState(existing?.phone || "");
+  const [countryCode, setCountryCode] = useState(existing?.countryCode || "+20");
   const [isAlumni, setIsAlumni] = useState(existing?.isAlumni ?? null);
   const [inRabita, setInRabita] = useState(existing?.inRabita ?? null);
   const [groupNum, setGroupNum] = useState(existing?.groupNum || "");
@@ -208,8 +267,13 @@ function OnboardView({ existing, onSave }) {
       <FBox>
         <FLabel>الاسم الكامل</FLabel>
         <FInput value={name} onChange={e => setName(e.target.value)} placeholder="اكتب اسمك هنا..." />
-        <FLabel style={{ marginTop: 12 }}>رقم التواصل</FLabel>
-        <FInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="مثال: 01xxxxxxxxx" />
+        <FLabel style={{ marginTop: 12 }}>رقم التواصل (اختيارى)</FLabel>
+        <div style={{ display: "flex", gap: 6 }}>
+          <select value={countryCode} onChange={e => setCountryCode(e.target.value)} style={{ width: 90, borderRadius: 8, border: "1px solid var(--color-border-tertiary)", padding: "10px 6px", fontSize: 13, fontFamily: "inherit", background: "var(--color-background-primary)", color: "var(--color-text-primary)", direction: "ltr" }}>
+            {["+20","+966","+971","+974","+973","+968","+965","+962","+961","+212","+216","+218","+249","+1","+44","+49","+33"].map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <FInput value={phone} onChange={e => setPhone(e.target.value)} placeholder="رقم الموبايل" style={{ direction: "ltr", textAlign: "left" }} />
+        </div>
       </FBox>
       <BtnPrimary disabled={!name.trim()} onClick={() => setStep(2)}>التالى ←</BtnPrimary>
       <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 8, background: "#FAEEDA", border: "1px solid #FAC775", textAlign: "right" }}>
@@ -281,7 +345,7 @@ function OnboardView({ existing, onSave }) {
           <ScopeCard selected={scope === 5} onClick={() => setScope(5)} title="أول 5 نقاط (مؤقتاً)" subtitle="ابدأ بالأهم وكمّل الباقى لاحقاً" icon="⚡" />
         </div>
       </FBox>
-      <BtnPrimary disabled={!scope} onClick={() => onSave({ name: name.trim(), phone: phone.trim(), isAlumni, inRabita, groupNum: groupNum.trim(), batchNum: batchNum.trim(), hasGallup: isAlumni ? true : hasGallup, scope, topN: scope })}>
+      <BtnPrimary disabled={!scope} onClick={() => onSave({ name: name.trim(), phone: phone.trim(), countryCode, isAlumni, inRabita, groupNum: groupNum.trim(), batchNum: batchNum.trim(), hasGallup: isAlumni ? true : hasGallup, scope, topN: scope })}>
         حفظ والبدء ✓
       </BtnPrimary>
     </Wrap>
@@ -336,7 +400,7 @@ function BtnPrimary({ children, disabled, onClick }) {
   return <button onClick={onClick} disabled={disabled} style={{ width: "100%", padding: "14px 0", borderRadius: 10, border: "none", background: disabled ? "var(--color-border-tertiary)" : BRAND.navy, color: BRAND.gold, fontSize: 15, fontWeight: 700, fontFamily: "inherit", cursor: disabled ? "default" : "pointer", transition: "background 0.2s" }}>{children}</button>;
 }
 
-function HomeView({ profile, entries, tasks, dailyLog, onNew, onSelect, onDelete, onExport, onEditProfile, onTasks, onTracker, onAdmin }) {
+function HomeView({ profile, entries, tasks, dailyLog, userEmail, onNew, onSelect, onDelete, onExport, onEditProfile, onTasks, onTracker, onAdmin, onLogout }) {
   const done = entries.length;
   const total = profile.scope || 34;
   const pct = Math.round((done / total) * 100);
@@ -354,6 +418,7 @@ function HomeView({ profile, entries, tasks, dailyLog, onNew, onSelect, onDelete
           <button onClick={onEditProfile} style={{ background: "none", border: "1px solid var(--color-border-tertiary)", borderRadius: 6, padding: "4px 10px", fontSize: 10, color: "var(--color-text-secondary)", fontFamily: "inherit", cursor: "pointer" }}>تعديل</button>
         </div>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+          {userEmail && <ProfileTag label={userEmail} color="#888" />}
           {profile.isAlumni && <ProfileTag label="خريج أكاديمية الإحسان" color="#0F6E56" />}
           {profile.inRabita && <ProfileTag label="رابطة الخريجين" color="#534AB7" />}
           {profile.batchNum && <ProfileTag label={`الدفعة ${profile.batchNum}`} color="#2E75B6" />}
@@ -390,6 +455,7 @@ function HomeView({ profile, entries, tasks, dailyLog, onNew, onSelect, onDelete
 
       {[...entries].sort((a, b) => (a.rank || 99) - (b.rank || 99)).map((e) => {
         const origIdx = entries.indexOf(e);
+        const hasTasks = tasks.some(t => t.entryName === e.name && t.subtasks.length > 0);
         return (
         <div key={origIdx} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", marginBottom: 6, borderRadius: 10, background: "var(--color-background-secondary)", border: "1px solid var(--color-border-tertiary)", cursor: "pointer" }} onClick={() => onSelect(origIdx)}>
           <span style={{ background: DOMAIN_COLORS[e.domain] || PC[1], color: "#fff", borderRadius: 6, width: 28, height: 28, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, flexShrink: 0 }}>{e.rank || "—"}</span>
@@ -397,7 +463,14 @@ function HomeView({ profile, entries, tasks, dailyLog, onNew, onSelect, onDelete
             <div style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-primary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.name}</div>
             <div style={{ fontSize: 10, color: "var(--color-text-tertiary)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{e.goal?.slice(0, 50)}...</div>
           </div>
-          <span style={{ fontSize: 16, color: PC[1] }}>✓</span>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 }}>
+            <span style={{ fontSize: 14, color: PC[1] }}>✓</span>
+            {hasTasks ? (
+              <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 6, background: `${BRAND.gold}20`, color: BRAND.gold, fontWeight: 600 }}>مُقسّم</span>
+            ) : (
+              <span style={{ fontSize: 8, padding: "1px 5px", borderRadius: 6, background: "var(--color-background-primary)", color: "var(--color-text-tertiary)", fontWeight: 600 }}>بدون مهام</span>
+            )}
+          </div>
           <button onClick={(ev) => { ev.stopPropagation(); if(confirm("حذف نقطة القوة دى؟")) onDelete(origIdx); }} style={{ background: "none", border: "none", color: "var(--color-text-tertiary)", cursor: "pointer", fontSize: 14, padding: 4 }}>✕</button>
         </div>
         );
@@ -458,6 +531,10 @@ function HomeView({ profile, entries, tasks, dailyLog, onNew, onSelect, onDelete
 
           <button onClick={onAdmin} style={{ width: "100%", marginTop: 8, padding: "10px 0", borderRadius: 10, border: "1px dashed var(--color-border-secondary)", background: "transparent", color: "var(--color-text-tertiary)", fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>
             لوحة تحكم الأدمن
+          </button>
+
+          <button onClick={onLogout} style={{ width: "100%", marginTop: 6, padding: "8px 0", borderRadius: 10, border: "none", background: "transparent", color: "var(--color-text-tertiary)", fontSize: 11, fontFamily: "inherit", cursor: "pointer" }}>
+            تسجيل خروج
           </button>
         </>
       )}
@@ -673,7 +750,32 @@ function StrengthSelector({ value, usedIdxs, onChange }) {
   );
 }
 
-function DetailView({ entry: e, onBack, onEdit }) {
+function DetailView({ entry: e, tasks, onBack, onEdit }) {
+  const [editing, setEditing] = useState(null);
+  const [editVal, setEditVal] = useState("");
+
+  const startEdit = (field, val) => { setEditing(field); setEditVal(val || ""); };
+  const saveEdit = () => { if (editing) { e[editing] = editVal; setEditing(null); } };
+
+  const EditableRow = ({ label, field, value }) => (
+    <div style={{ marginBottom: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ fontSize: 11, fontWeight: 600, color: "var(--color-text-secondary)", marginBottom: 1 }}>{label}</div>
+        <button onClick={() => startEdit(field, value)} style={{ background: "none", border: "none", color: BRAND.gold, cursor: "pointer", fontSize: 10, fontFamily: "inherit", padding: 0 }}>✎</button>
+      </div>
+      {editing === field ? (
+        <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+          <textarea value={editVal} onChange={ev => setEditVal(ev.target.value)} rows={2} style={{ flex: 1, borderRadius: 6, border: `1.5px solid ${BRAND.gold}`, padding: "6px 8px", fontSize: 12, fontFamily: "inherit", direction: "rtl", background: "var(--color-background-primary)", color: "var(--color-text-primary)", resize: "vertical", lineHeight: 1.6 }} />
+          <button onClick={saveEdit} style={{ padding: "4px 10px", borderRadius: 6, border: "none", background: BRAND.navy, color: BRAND.gold, fontSize: 10, fontWeight: 600, fontFamily: "inherit", cursor: "pointer", alignSelf: "flex-start" }}>حفظ</button>
+        </div>
+      ) : (
+        <div style={{ fontSize: 13, color: "var(--color-text-primary)", lineHeight: 1.7 }}>{value}</div>
+      )}
+    </div>
+  );
+
+  const entryTasks = tasks?.find(t => t.entryName === e.name);
+
   return (
     <Wrap>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
@@ -689,44 +791,45 @@ function DetailView({ entry: e, onBack, onEdit }) {
       </div>
 
       <Sec title="التعرف على نقطة القوة" color={PC[1]}>
-        <Row label="المفهوم العام" value={e.concept} />
-        <Row label="التقديم للآخرين" value={e.present} />
-        <Row label="التعامل مع شخصية تمتلكها" value={e.interact} />
+        <EditableRow label="المفهوم العام" field="concept" value={e.concept} />
+        <EditableRow label="التقديم للآخرين" field="present" value={e.present} />
+        <EditableRow label="التعامل مع شخصية تمتلكها" field="interact" value={e.interact} />
         <div style={{ margin: "8px 0", padding: "8px 12px", borderRadius: 8, background: `${BRAND.gold}10`, border: `1px dashed ${BRAND.gold}40` }}>
           <div style={{ fontSize: 11, fontWeight: 600, color: BRAND.gold, marginBottom: 4 }}>معادلة فك الشفرة</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <Tag label="الموهبة" value={e.talent} bg="#EEEDFE" color="#534AB7" />
-            <span style={{ fontWeight: 700, color: "var(--color-text-secondary)" }}>×</span>
-            <Tag label="الاستثمار" value={e.investment} bg="#FAECE7" color="#D85A30" />
-          </div>
+          <EditableRow label="الموهبة" field="talent" value={e.talent} />
+          <EditableRow label="الاستثمار" field="investment" value={e.investment} />
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-          <SBox l="S" v={e.s} bg="#E1F5EE" c="#0F6E56" /><SBox l="W" v={e.w} bg="#FCEBEB" c="#A32D2D" />
-          <SBox l="O" v={e.o} bg="#E1F5EE" c="#085041" /><SBox l="T" v={e.t_swot} bg="#FAEEDA" c="#854F0B" />
-        </div>
+        <EditableRow label="S — أقوى جانب" field="s" value={e.s} />
+        <EditableRow label="W — خطر داخلى" field="w" value={e.w} />
+        <EditableRow label="O — فرصة" field="o" value={e.o} />
+        <EditableRow label="T — تهديد خارجى" field="t_swot" value={e.t_swot} />
       </Sec>
 
       <Sec title="الفهم وتحليل المراجع #بإحسان" color={BRAND.gold}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
-          <MC label="اسم الله" value={e.allah_name} /><MC label="النبى ﷺ" value={e.prophet} />
-          <MC label="القدوة" value={e.rolemodel} /><MC label="القرآن" value={e.quran} />
-        </div>
-        <div style={{ marginTop: 6, padding: "6px 10px", borderRadius: 6, background: "#FCEBEB" }}>
-          <span style={{ fontSize: 11, fontWeight: 600, color: "#A32D2D" }}>نحذر من: </span>
-          <span style={{ fontSize: 12, color: "#791F1F" }}>{e.warning}</span>
-        </div>
+        <EditableRow label="اسم الله" field="allah_name" value={e.allah_name} />
+        <EditableRow label="طريقة النبى ﷺ" field="prophet" value={e.prophet} />
+        <EditableRow label="القدوة من السيرة" field="rolemodel" value={e.rolemodel} />
+        <EditableRow label="القرآن الكريم" field="quran" value={e.quran} />
+        <EditableRow label="نحذر من؟" field="warning" value={e.warning} />
       </Sec>
 
       <Sec title="التحديد واختيار الهدف" color={PC[3]}>
-        <Tag label="عجلة الحياة" value={e.wheel} bg="#E1F5EE" color="#0F6E56" />
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6, margin: "8px 0" }}>
-          <MC label="KPI الحفاظ" value={e.kpi1} /><MC label="KPI النمو" value={e.kpi2} />
-        </div>
-        <div style={{ padding: "10px 12px", borderRadius: 8, background: "var(--color-background-info)", border: "1.5px solid var(--color-border-info)" }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: "var(--color-text-info)", marginBottom: 2 }}>الهدف SMART</div>
-          <div style={{ fontSize: 13, color: "var(--color-text-primary)", lineHeight: 1.8 }}>{e.goal}</div>
-        </div>
+        <EditableRow label="جانب عجلة الحياة" field="wheel" value={e.wheel} />
+        <EditableRow label="KPI #1 — قياس الحفاظ" field="kpi1" value={e.kpi1} />
+        <EditableRow label="KPI #2 — قياس النمو" field="kpi2" value={e.kpi2} />
+        <EditableRow label="الهدف SMART" field="goal" value={e.goal} />
       </Sec>
+
+      {entryTasks && entryTasks.subtasks.length > 0 && (
+        <Sec title="المهام المقسمة" color={BRAND.gold}>
+          {entryTasks.subtasks.map((s, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 0", borderBottom: i < entryTasks.subtasks.length - 1 ? "1px solid var(--color-border-tertiary)" : "none" }}>
+              <span style={{ fontSize: 10, color: "var(--color-text-tertiary)", flexShrink: 0 }}>{s.day || "—"}</span>
+              <span style={{ fontSize: 12, color: "var(--color-text-primary)" }}>{s.text}</span>
+            </div>
+          ))}
+        </Sec>
+      )}
     </Wrap>
   );
 }
@@ -801,7 +904,7 @@ function TaskBreakdownView({ entries, tasks: existingTasks, onSave, onBack }) {
             <div style={{ flex: 1, fontSize: 12, color: "var(--color-text-primary)" }}>{s.text}</div>
             <select value={s.day} onChange={e => setDay(i, e.target.value)} style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, border: "1px solid var(--color-border-tertiary)", fontFamily: "inherit", background: "var(--color-background-primary)", color: "var(--color-text-primary)" }}>
               <option value="">يوم؟</option>
-              {DAYS.map(d => <option key={d} value={d} disabled={dayCount(d) >= 7}>{d} {dayCount(d) >= 7 ? "(ممتلئ)" : `(${dayCount(d)}/7)`}</option>)}
+              {DAYS.map(d => <option key={d} value={d} disabled={dayCount(d) >= 7}>{d}</option>)}
             </select>
             <button onClick={() => removeTask(i)} style={{ background: "none", border: "none", color: "#A32D2D", cursor: "pointer", fontSize: 12, padding: 2 }}>✕</button>
           </div>
@@ -821,18 +924,32 @@ function TaskBreakdownView({ entries, tasks: existingTasks, onSave, onBack }) {
 }
 
 function DailyTrackerView({ tasks, dailyLog, onSave, onReview, onBack }) {
-  const today = new Date().toISOString().slice(0, 10);
+  const todayDate = new Date();
+  const today = todayDate.toISOString().slice(0, 10);
   const DAYS = ["الجمعة", "السبت", "الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس"];
-  const dayIdx = new Date().getDay();
+  const dayIdx = todayDate.getDay();
   const dayMap = [1, 2, 3, 4, 5, 6, 0];
   const todayName = DAYS[dayMap[dayIdx]];
   const isFriday = dayIdx === 5;
+  const [viewMode, setViewMode] = useState("day");
+  const [selectedDay, setSelectedDay] = useState(todayName);
 
-  const todayTasks = tasks.flatMap((g, gi) => g.subtasks.filter(s => s.day === todayName).map((s, si) => ({ ...s, goalIdx: gi, goalName: g.entryName, subIdx: g.subtasks.indexOf(s) })));
+  const fridayOffset = ((dayIdx + 2) % 7);
+  const weekDates = DAYS.map((_, i) => {
+    const d = new Date(todayDate);
+    d.setDate(d.getDate() - fridayOffset + i);
+    return d;
+  });
+  const formatShort = (d) => `${d.getDate()}/${d.getMonth() + 1}`;
+  const selectedDate = weekDates[DAYS.indexOf(selectedDay)];
+
+  const getTasksForDay = (day) => tasks.flatMap((g, gi) => g.subtasks.filter(s => s.day === day).map((s) => ({ ...s, goalIdx: gi, goalName: g.entryName, subIdx: g.subtasks.indexOf(s) })));
+
+  const dayTasks = getTasksForDay(selectedDay);
   const log = dailyLog[today] || {};
   const doneCount = Object.values(log).filter(Boolean).length;
-  const totalToday = todayTasks.length;
-  const pct = totalToday > 0 ? Math.round((doneCount / totalToday) * 100) : 0;
+  const todayTotal = getTasksForDay(todayName).length;
+  const pct = todayTotal > 0 ? Math.round((doneCount / todayTotal) * 100) : 0;
 
   const allDates = Object.keys(dailyLog).sort();
   let streak = 0;
@@ -849,38 +966,104 @@ function DailyTrackerView({ tasks, dailyLog, onSave, onReview, onBack }) {
 
   return (
     <Wrap>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
         <button onClick={onBack} style={{ background: "none", border: "none", color: "var(--color-text-secondary)", cursor: "pointer", fontSize: 13, fontFamily: "inherit" }}>→ رجوع</button>
-        <span style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)" }}>المتابعة اليومية</span>
+        <span style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)" }}>المتابعة</span>
       </div>
 
-      <div style={{ display: "flex", justifyContent: "space-around", padding: "14px 0", marginBottom: 12, background: "var(--color-background-secondary)", borderRadius: 12, border: "1px solid var(--color-border-tertiary)" }}>
-        <Stat n={todayName} label="اليوم" color={BRAND.navy} />
+      <div style={{ display: "flex", justifyContent: "space-around", padding: "12px 0", marginBottom: 10, background: "var(--color-background-secondary)", borderRadius: 12, border: "1px solid var(--color-border-tertiary)" }}>
         <Stat n={pct + "%"} label="إنجاز اليوم" color={pct >= 80 ? "#0F6E56" : pct >= 50 ? BRAND.gold : PC[3]} />
         <Stat n={streak} label="أيام متتالية" color={BRAND.gold} />
       </div>
 
-      <div style={{ height: 6, borderRadius: 3, background: "var(--color-border-tertiary)", marginBottom: 14, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${pct}%`, background: pct >= 80 ? "#0F6E56" : pct >= 50 ? BRAND.gold : PC[3], borderRadius: 3, transition: "width 0.3s" }} />
+      <div style={{ display: "flex", gap: 4, marginBottom: 10 }}>
+        <button onClick={() => setViewMode("day")} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: viewMode === "day" ? BRAND.navy : "var(--color-background-secondary)", color: viewMode === "day" ? BRAND.gold : "var(--color-text-secondary)", fontSize: 12, fontWeight: 600, fontFamily: "inherit", cursor: "pointer" }}>يومى</button>
+        <button onClick={() => setViewMode("week")} style={{ flex: 1, padding: "6px 0", borderRadius: 8, border: "none", background: viewMode === "week" ? BRAND.navy : "var(--color-background-secondary)", color: viewMode === "week" ? BRAND.gold : "var(--color-text-secondary)", fontSize: 12, fontWeight: 600, fontFamily: "inherit", cursor: "pointer" }}>أسبوعى</button>
       </div>
 
-      {todayTasks.length === 0 && (
-        <div style={{ textAlign: "center", padding: "24px 0", color: "var(--color-text-tertiary)", fontSize: 13 }}>مفيش مهام مخصصة لليوم ({todayName})</div>
-      )}
-
-      {todayTasks.map((t, i) => {
-        const key = `${t.goalIdx}-${t.subIdx}`;
-        const checked = !!log[key];
-        return (
-          <div key={i} onClick={() => toggle(key)} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 12px", marginBottom: 6, borderRadius: 10, background: "var(--color-background-secondary)", border: checked ? `1.5px solid #0F6E56` : "1px solid var(--color-border-tertiary)", cursor: "pointer", opacity: checked ? 0.7 : 1 }}>
-            <div style={{ width: 22, height: 22, borderRadius: 6, border: checked ? "none" : "2px solid var(--color-border-secondary)", background: checked ? "#0F6E56" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: "#fff", flexShrink: 0, marginTop: 1 }}>{checked ? "✓" : ""}</div>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 13, color: "var(--color-text-primary)", textDecoration: checked ? "line-through" : "none", lineHeight: 1.6 }}>{t.text}</div>
-              <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{t.goalName?.split(" - ")[1] || t.goalName}</div>
+      <div style={{ display: "flex", gap: 3, marginBottom: 12 }}>
+        {DAYS.map((day, i) => {
+          const wd = weekDates[i];
+          const isToday = day === todayName;
+          const isSel = day === selectedDay;
+          const tasksCount = getTasksForDay(day).length;
+          return (
+            <div key={day} onClick={() => setSelectedDay(day)}
+              style={{ flex: 1, textAlign: "center", padding: "6px 2px", borderRadius: 8, cursor: "pointer",
+                border: isSel ? `2px solid ${BRAND.navy}` : isToday ? `1.5px solid ${BRAND.gold}` : "1px solid var(--color-border-tertiary)",
+                background: isSel ? `${BRAND.navy}12` : "var(--color-background-primary)" }}>
+              <div style={{ fontSize: 9, fontWeight: 600, color: isToday ? BRAND.gold : "var(--color-text-tertiary)" }}>{day.slice(0, 5)}</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: isSel ? BRAND.navy : "var(--color-text-primary)", margin: "2px 0" }}>{wd.getDate()}</div>
+              <div style={{ fontSize: 8, color: "var(--color-text-tertiary)" }}>{wd.getMonth() + 1}/{wd.getFullYear().toString().slice(2)}</div>
+              {tasksCount > 0 && <div style={{ width: 5, height: 5, borderRadius: "50%", background: isToday ? BRAND.gold : BRAND.navy, margin: "3px auto 0" }} />}
             </div>
+          );
+        })}
+      </div>
+
+      {viewMode === "week" ? (
+        <div style={{ marginBottom: 12 }}>
+          {DAYS.map((day, di) => {
+            const dt = getTasksForDay(day);
+            const isToday = day === todayName;
+            const wd = weekDates[di];
+            if (dt.length === 0) return null;
+            return (
+              <div key={day} style={{ marginBottom: 6, borderRadius: 10, border: isToday ? `2px solid ${BRAND.gold}` : "1px solid var(--color-border-tertiary)", background: "var(--color-background-secondary)", overflow: "hidden" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", borderBottom: "1px solid var(--color-border-tertiary)" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: isToday ? BRAND.gold : "var(--color-text-primary)" }}>{day}</span>
+                    <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{formatShort(wd)}</span>
+                    {isToday && <span style={{ fontSize: 8, padding: "1px 6px", borderRadius: 8, background: BRAND.gold, color: BRAND.navy, fontWeight: 600 }}>اليوم</span>}
+                  </div>
+                  <span style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{dt.length} مهام</span>
+                </div>
+                <div style={{ padding: "4px 12px 8px" }}>
+                  {dt.map((t, i) => {
+                    const key = `${t.goalIdx}-${t.subIdx}`;
+                    const checked = isToday ? !!log[key] : false;
+                    return (
+                      <div key={i} onClick={() => { if (isToday) toggle(key); }}
+                        style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 0", borderTop: i > 0 ? "1px solid var(--color-border-tertiary)" : "none", cursor: isToday ? "pointer" : "default" }}>
+                        <div style={{ width: 18, height: 18, borderRadius: 4, border: checked ? "none" : "1.5px solid var(--color-border-secondary)", background: checked ? "#0F6E56" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, color: "#fff", flexShrink: 0 }}>{checked ? "✓" : ""}</div>
+                        <div style={{ flex: 1 }}>
+                          <span style={{ fontSize: 12, color: "var(--color-text-primary)", textDecoration: checked ? "line-through" : "none", opacity: checked ? 0.6 : 1 }}>{t.text}</span>
+                          <span style={{ fontSize: 9, color: "var(--color-text-tertiary)", marginRight: 6 }}>{t.goalName?.split(" - ")[1] || ""}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ) : (
+        <>
+          <div style={{ textAlign: "center", marginBottom: 10 }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: "var(--color-text-primary)" }}>{selectedDay} — {selectedDate ? formatShort(selectedDate) : ""}</span>
           </div>
-        );
-      })}
+
+          {dayTasks.length === 0 && (
+            <div style={{ textAlign: "center", padding: "24px 0", color: "var(--color-text-tertiary)", fontSize: 13 }}>مفيش مهام مخصصة ليوم {selectedDay}</div>
+          )}
+
+          {dayTasks.map((t, i) => {
+            const key = `${t.goalIdx}-${t.subIdx}`;
+            const checked = selectedDay === todayName ? !!log[key] : false;
+            const isClickable = selectedDay === todayName;
+            return (
+              <div key={i} onClick={() => isClickable && toggle(key)} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 12px", marginBottom: 6, borderRadius: 10, background: "var(--color-background-secondary)", border: checked ? `1.5px solid #0F6E56` : "1px solid var(--color-border-tertiary)", cursor: isClickable ? "pointer" : "default", opacity: checked ? 0.7 : 1 }}>
+                <div style={{ width: 22, height: 22, borderRadius: 6, border: checked ? "none" : "2px solid var(--color-border-secondary)", background: checked ? "#0F6E56" : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: "#fff", flexShrink: 0, marginTop: 1 }}>{checked ? "✓" : ""}</div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, color: "var(--color-text-primary)", textDecoration: checked ? "line-through" : "none", lineHeight: 1.6 }}>{t.text}</div>
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{t.goalName?.split(" - ")[1] || t.goalName}</div>
+                </div>
+              </div>
+            );
+          })}
+        </>
+      )}
 
       {isFriday && (
         <button onClick={onReview} style={{ width: "100%", marginTop: 14, padding: "14px 0", borderRadius: 10, border: "none", background: BRAND.gold, color: BRAND.navy, fontSize: 14, fontWeight: 700, fontFamily: "inherit", cursor: "pointer" }}>
@@ -956,11 +1139,28 @@ function AdminDashboard({ onBack }) {
   const [filters, setFilters] = useState({ alumni: null, rabita: null, batch: "", group: "", scope: null });
 
   useEffect(() => {
-    try {
-      const allUsers = JSON.parse(localStorage.getItem("kbq-all-users") || "{}");
-      setUsers(Object.values(allUsers));
-    } catch {}
-    setLoading(false);
+    async function load() {
+      try {
+        const usersSnap = await getDocs(collection(db, "users"));
+        const all = [];
+        for (const userDoc of usersSnap.docs) {
+          const uid = userDoc.id;
+          const [profileSnap, entriesSnap] = await Promise.all([
+            getDoc(doc(db, "users", uid, "meta", "profile")),
+            getDoc(doc(db, "users", uid, "data", "entries"))
+          ]);
+          if (profileSnap.exists()) {
+            all.push({
+              profile: profileSnap.data(),
+              entries: entriesSnap.exists() ? entriesSnap.data().value : []
+            });
+          }
+        }
+        setUsers(all);
+      } catch(e) { console.error(e); }
+      setLoading(false);
+    }
+    load();
   }, []);
 
   const filtered = users.filter(u => {
@@ -975,10 +1175,10 @@ function AdminDashboard({ onBack }) {
   });
 
   const exportExcel = () => {
-    const rows = [["الاسم", "الهاتف", "خريج", "رابطة", "الدفعة", "الجروب", "النطاق", "نقاط مكتملة"].join("\t")];
+    const rows = [["الاسم", "الإيميل", "الهاتف", "خريج", "رابطة", "الدفعة", "الجروب", "النطاق", "نقاط مكتملة"].join("\t")];
     filtered.forEach(u => {
       const p = u.profile || {};
-      rows.push([p.name, p.phone, p.isAlumni ? "نعم" : "لا", p.inRabita ? "نعم" : "لا", p.batchNum, p.groupNum, p.scope, (u.entries || []).length].join("\t"));
+      rows.push([p.name, p.email, (p.countryCode||"") + (p.phone||""), p.isAlumni ? "نعم" : "لا", p.inRabita ? "نعم" : "لا", p.batchNum, p.groupNum, p.scope, (u.entries || []).length].join("\t"));
     });
     const blob = new Blob(["\uFEFF" + rows.join("\n")], { type: "text/tab-separated-values;charset=utf-8" });
     const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "admin_users.xls"; a.click();
